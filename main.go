@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -40,6 +41,7 @@ type Config struct {
 	Bucket         string `json:"bucket"`
 	AESKeyB64      string `json:"aes_key_b64"`
 	CallbackURL    string `json:"callback_url"`
+	MaxUploadBytes int64  `json:"max_upload_bytes"`
 }
 
 type CallbackPayload struct {
@@ -52,11 +54,12 @@ type CallbackPayload struct {
 	DurationMs   int64  `json:"duration_ms,omitempty"`
 	HashAfter    string `json:"hash_after,omitempty"`
 	// waktu (ms)
-	DurationTotalMs      int64 `json:"duration_total_ms,omitempty"`
-	DurationCompressMs   int64 `json:"duration_compress_ms,omitempty"`
-	DurationEncryptMs    int64 `json:"duration_encrypt_ms,omitempty"`
-	DurationDecryptMs    int64 `json:"duration_decrypt_ms,omitempty"`
-	DurationDecompressMs int64 `json:"duration_decompress_ms,omitempty"`
+	DurationTotalMs      int64  `json:"duration_total_ms,omitempty"`
+	DurationCompressMs   int64  `json:"duration_compress_ms,omitempty"`
+	DurationEncryptMs    int64  `json:"duration_encrypt_ms,omitempty"`
+	DurationDecryptMs    int64  `json:"duration_decrypt_ms,omitempty"`
+	DurationDecompressMs int64  `json:"duration_decompress_ms,omitempty"`
+	ErrorMessage         string `json:"error_message,omitempty"`
 }
 
 var (
@@ -121,6 +124,13 @@ func writeUint64(w io.Writer, v uint64) error {
 	return err
 }
 
+// Limitasi FIle
+func applyDefaults() {
+	if cfg.MaxUploadBytes <= 0 {
+		cfg.MaxUploadBytes = 10 << 20 // 10MB default
+	}
+}
+
 func readUint64(r io.Reader) (uint64, error) {
 	var b [8]byte
 	_, err := io.ReadFull(r, b[:])
@@ -167,7 +177,14 @@ func generateUniqueObjectName(
 
 func UploadHandler(w http.ResponseWriter, r *http.Request) {
 
-	// ⏱️ Mulai hitung durasi upload (encrypt + compress + upload)
+	// ============================
+	// LIMIT UPLOAD SIZE
+	// ============================
+	// Batasi ukuran request body supaya tidak bisa upload file > cfg.MaxUploadBytes
+	// Contoh: cfg.MaxUploadBytes = 10 * 1024 * 1024 (10MB)
+	r.Body = http.MaxBytesReader(w, r.Body, cfg.MaxUploadBytes)
+
+	// ⏱️ Mulai hitung durasi total upload
 	start := time.Now()
 
 	// ============================
@@ -183,6 +200,24 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 	backupID, _ := strconv.ParseInt(backupIDStr, 10, 64)
 
 	// ============================
+	// helper callback fail (ONLY ONCE)
+	// ============================
+	var failOnce sync.Once
+
+	sendUploadFailed := func(msg string) {
+		failOnce.Do(func() {
+			log.Printf("[UPLOAD] FAILED backup_id=%d filename=%s msg=%s", backupID, filename, msg)
+
+			sendCallback(CallbackPayload{
+				Event:        "upload_failed",
+				BackupID:     backupID,
+				Filename:     filename,
+				ErrorMessage: msg,
+			})
+		})
+	}
+
+	// ============================
 	// GENERATE OBJECT NAME (ANTI OVERWRITE)
 	// ============================
 	objectBase := fmt.Sprintf("backups/%s.enc", filename)
@@ -192,28 +227,42 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 		objectBase,
 	)
 	if err != nil {
-		// 🚨 CALLBACK FAILED
-		sendCallback(CallbackPayload{
-			Event:    "upload_failed",
-			BackupID: backupID,
-		})
+		sendUploadFailed("failed generate object name: " + err.Error())
 		http.Error(w, "failed generate object name", 500)
 		return
 	}
 
-	// Ukuran file asli (sebelum kompresi & enkripsi)
+	// ============================
+	// ORIGINAL SIZE CHECK (BEST EFFORT)
+	// ============================
+	// ContentLength kadang -1 (unknown), jadi check ini hanya jika > 0
 	originalSize := r.ContentLength
-	log.Printf("[UPLOAD] start filename=%s backup_id=%d size=%d",
-		filename, backupID, originalSize)
+	if originalSize > 0 && originalSize > cfg.MaxUploadBytes {
+		msg := fmt.Sprintf("file too large (max %d bytes)", cfg.MaxUploadBytes)
+		sendUploadFailed(msg)
+
+		http.Error(w, msg, http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	log.Printf("[UPLOAD] start filename=%s backup_id=%d size=%d max=%d",
+		filename, backupID, originalSize, cfg.MaxUploadBytes)
 
 	// ============================
 	// DETEKSI MODE UPLOAD
 	// ============================
 	fileReader := r.Body
 
-	// Jika multipart/form-data (upload via form)
+	// jika multipart upload (form-data)
 	if strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
-		mr, _ := r.MultipartReader()
+		mr, err := r.MultipartReader()
+		if err != nil {
+			sendUploadFailed("multipart reader failed: " + err.Error())
+			http.Error(w, "multipart reader failed", 500)
+			return
+		}
+
+		found := false
 		for {
 			part, err := mr.NextPart()
 			if err != nil {
@@ -221,11 +270,23 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			if part.FormName() == "file" {
 				fileReader = part
+				found = true
 				break
 			}
 		}
+
+		if !found {
+			sendUploadFailed("missing multipart field: file")
+			http.Error(w, "missing file part", 400)
+			return
+		}
+
 		log.Printf("[UPLOAD] multipart mode enabled")
 	}
+
+	// ============================
+	// TIMER VARS
+	// ============================
 	var compressStart time.Time
 	var encryptStart time.Time
 
@@ -234,8 +295,23 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// ============================
 	// PIPE UNTUK STREAM KE MINIO
+	// pr -> dibaca PutObject
+	// pw <- ditulis pipeline
 	// ============================
 	pr, pw := io.Pipe()
+
+	// =====================================================
+	// ✅ NEW: CHANNEL CONTROL (ANTI STUCK)
+	// =====================================================
+	// pipeErr: pipeline error (misal upload too large) -> handler bisa stop PutObject dan return 413
+	pipeErr := make(chan error, 1)
+
+	// putDone: sinyal PutObject selesai
+	putDone := make(chan struct{})
+	var (
+		info   minio.UploadInfo
+		putErr error
+	)
 
 	// ============================
 	// PIPELINE GOROUTINE
@@ -248,22 +324,39 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 		// ============================
 		gcm, err := aesgcm.NewAESGCM(aesKey)
 		if err != nil {
-			// 🚨 CALLBACK FAILED
-			sendCallback(CallbackPayload{
-				Event:    "upload_failed",
-				BackupID: backupID,
-			})
+			sendUploadFailed("aesgcm init failed: " + err.Error())
 			pw.CloseWithError(err)
+
+			// notify handler
+			select {
+			case pipeErr <- err:
+			default:
+			}
+
 			return
 		}
 
 		// ============================
 		// PIPE: COMPRESS → ENCRYPT
+		// compPw: output compressor
+		// compPr: input encryptor
 		// ============================
 		compPr, compPw := io.Pipe()
 
-		// Deflate compression (supporting, bukan inti kripto)
-		flateWriter, _ := flate.NewWriter(compPw, flate.DefaultCompression)
+		// Deflate compression supporting
+		flateWriter, err := flate.NewWriter(compPw, flate.DefaultCompression)
+		if err != nil {
+			sendUploadFailed("flate.NewWriter failed: " + err.Error())
+			pw.CloseWithError(err)
+
+			// notify handler
+			select {
+			case pipeErr <- err:
+			default:
+			}
+
+			return
+		}
 
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -273,52 +366,105 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 		// =====================================================
 		// ENCRYPTOR
-		// compPr → AES-GCM → pw → MinIO
+		// compPr → AES-GCM → pw
 		// =====================================================
 		go func() {
 			defer wg.Done()
 			defer compPr.Close()
 
-			//Waktu Mulai perhitungan proses enkripsi
+			// Start encrypt timer (ketika encryptor mulai bekerja)
 			encryptStart = time.Now()
 
 			buf := make([]byte, BLOCK_SIZE)
 
 			for {
 				n, err := compPr.Read(buf)
+
 				if n > 0 {
 					encBytes += int64(n)
 
-					// Log progress setiap interval tertentu
+					// Progress log
 					if encBytes%LOG_INTERVAL < int64(n) {
 						log.Printf("[ENCRYPT] %s encrypted %.2f MB",
 							filename, float64(encBytes)/1024/1024)
 					}
 
-					// 🔐 Nonce unik per block
+					// Nonce unik per block
 					nonce := make([]byte, aesgcm.NonceSize)
-					rand.Read(nonce)
+					if _, errRand := rand.Read(nonce); errRand != nil {
+						sendUploadFailed("nonce rand failed: " + errRand.Error())
+						pw.CloseWithError(errRand)
 
-					// AES-256-GCM Encrypt
-					ciphertext, tag, err := gcm.Encrypt(buf[:n], nonce)
-					if err != nil {
-						sendCallback(CallbackPayload{
-							Event:    "upload_failed",
-							BackupID: backupID,
-						})
-						pw.CloseWithError(err)
+						// notify handler
+						select {
+						case pipeErr <- errRand:
+						default:
+						}
+
 						return
 					}
 
-					// Format penyimpanan:
-					// [NONCE][CIPHER_LEN][CIPHERTEXT][TAG]
-					pw.Write(nonce)
-					writeUint64(pw, uint64(len(ciphertext)))
-					pw.Write(ciphertext)
-					pw.Write(tag)
+					// Encrypt manual AES-GCM
+					ciphertext, tag, errEnc := gcm.Encrypt(buf[:n], nonce)
+					if errEnc != nil {
+						sendUploadFailed("encrypt failed: " + errEnc.Error())
+						pw.CloseWithError(errEnc)
+
+						// notify handler
+						select {
+						case pipeErr <- errEnc:
+						default:
+						}
+
+						return
+					}
+
+					// Format:
+					// [NONCE (12B)] [CIPHER_LEN (8B)] [CIPHERTEXT (N)] [TAG (16B)]
+					if _, err := pw.Write(nonce); err != nil {
+						sendUploadFailed("pipe write nonce failed: " + err.Error())
+
+						select {
+						case pipeErr <- err:
+						default:
+						}
+
+						return
+					}
+					if err := writeUint64(pw, uint64(len(ciphertext))); err != nil {
+						sendUploadFailed("pipe write cipher len failed: " + err.Error())
+
+						select {
+						case pipeErr <- err:
+						default:
+						}
+
+						return
+					}
+					if _, err := pw.Write(ciphertext); err != nil {
+						sendUploadFailed("pipe write ciphertext failed: " + err.Error())
+
+						select {
+						case pipeErr <- err:
+						default:
+						}
+
+						return
+					}
+					if _, err := pw.Write(tag); err != nil {
+						sendUploadFailed("pipe write tag failed: " + err.Error())
+
+						select {
+						case pipeErr <- err:
+						default:
+						}
+
+						return
+					}
 				}
 
 				if err != nil {
+					// EOF normal
 					return
 				}
 			}
@@ -329,71 +475,128 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 		// fileReader → Deflate → compPw
 		// =====================================================
 		buf := make([]byte, BLOCK_SIZE)
-
 		compressStart = time.Now()
+
 		for {
 			n, err := fileReader.Read(buf)
+
+			if err != nil {
+				// 🚨 request entity too large (MaxBytesReader)
+				if strings.Contains(err.Error(), "http: request body too large") {
+					msg := fmt.Sprintf("file too large (max=%d bytes)", cfg.MaxUploadBytes)
+					sendUploadFailed(msg)
+
+					// ✅ notify handler utama agar response langsung selesai
+					select {
+					case pipeErr <- errors.New(msg):
+					default:
+					}
+
+					// stop pipeline
+					pw.CloseWithError(err)
+					_ = flateWriter.Close()
+					_ = compPw.Close()
+					return
+				}
+
+				// EOF normal / atau error lain
+				_ = flateWriter.Close()
+				_ = compPw.Close()
+				compressDuration = time.Since(compressStart).Milliseconds()
+				break
+			}
+
 			if n > 0 {
 				readBytes += int64(n)
 
+				// Progress log
 				if readBytes%LOG_INTERVAL < int64(n) {
 					log.Printf("[READ] %s read %.2f MB",
 						filename, float64(readBytes)/1024/1024)
 				}
 
-				flateWriter.Write(buf[:n])
-			}
+				if _, errW := flateWriter.Write(buf[:n]); errW != nil {
+					sendUploadFailed("compress write failed: " + errW.Error())
 
-			if err != nil {
-				// Tutup compressor → sinyal EOF ke encryptor
-				flateWriter.Close()
-				compPw.Close()
+					select {
+					case pipeErr <- errW:
+					default:
+					}
 
-				compressDuration = time.Since(compressStart).Milliseconds()
-				break
+					pw.CloseWithError(errW)
+					_ = flateWriter.Close()
+					_ = compPw.Close()
+					return
+				}
 			}
 		}
 
+		// tunggu encryptor selesai (EOF dari compressor sudah dikirim)
 		wg.Wait()
-		// 🔹 END encrypt timer
+
+		// stop encrypt timer
 		if !encryptStart.IsZero() {
 			encryptDuration = time.Since(encryptStart).Milliseconds()
 			log.Printf("[UPLOAD] encryption finished in %d ms", encryptDuration)
 		}
 
-		log.Printf("[UPLOAD] pipeline finished filename=%s", filename)
+		log.Printf("[UPLOAD] pipeline finished filename=%s compress=%d ms encrypt=%d ms",
+			filename, compressDuration, encryptDuration)
 	}()
 
-	// ============================
-	// STREAM KE MINIO
-	// ============================
-	info, err := minioClient.PutObject(
-		context.Background(),
-		cfg.Bucket,
-		objectName,
-		pr,
-		-1,
-		minio.PutObjectOptions{},
-	)
-	if err != nil {
-		// 🚨 CALLBACK FAILED
-		sendCallback(CallbackPayload{
-			Event:    "upload_failed",
-			BackupID: backupID,
+	// =====================================================
+	// ✅ NEW: PutObject ASYNC (biar select bisa cancel stuck)
+	// =====================================================
+	go func() {
+		info, putErr = minioClient.PutObject(
+			context.Background(),
+			cfg.Bucket,
+			objectName,
+			pr,
+			-1,
+			minio.PutObjectOptions{},
+		)
+		close(putDone)
+	}()
+
+	// =====================================================
+	// ✅ NEW: SELECT RESULT (PIPELINE FAIL vs PUTOBJECT DONE)
+	// =====================================================
+	select {
+	case err := <-pipeErr:
+		// pipeline fail -> stop PutObject read
+		_ = pr.CloseWithError(err)
+
+		// Return 413 supaya UI Laravel stop loading
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "failed",
+			"error":  err.Error(),
 		})
-		http.Error(w, err.Error(), 500)
 		return
+
+	case <-putDone:
+		// PutObject selesai
+		if putErr != nil {
+			sendUploadFailed("minio PutObject failed: " + putErr.Error())
+			http.Error(w, putErr.Error(), 500)
+			return
+		}
 	}
+
 	totalDuration := time.Since(start).Milliseconds()
 
 	// ============================
 	// CALLBACK SUCCESS
 	// ============================
 	log.Printf(
-		"[UPLOAD] done filename=%s stored=%.2f MB duration=%d ms",
+		"[UPLOAD] done filename=%s stored=%.2f MB total=%d ms compress=%d ms encrypt=%d ms",
 		filename,
 		float64(info.Size)/1024/1024,
 		totalDuration,
+		compressDuration,
+		encryptDuration,
 	)
 
 	sendCallback(CallbackPayload{
@@ -403,11 +606,13 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 		MinioPath:          objectName,
 		OriginalSize:       originalSize,
 		FinalSize:          info.Size,
-		DurationMs:         encryptDuration,
-		DurationCompressMs: compressDuration, // compress
-		DurationTotalMs:    totalDuration,    // total
+		DurationMs:         encryptDuration, // legacy alias
+		DurationEncryptMs:  encryptDuration,
+		DurationCompressMs: compressDuration,
+		DurationTotalMs:    totalDuration,
 	})
 
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"status": "uploaded",
 	})
