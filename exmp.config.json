@@ -1,0 +1,10 @@
+{
+  "listen": ":9090",
+  "minio_endpoint": "",
+  "minio_use_ssl": false,
+  "minio_access_key": "",
+  "minio_secret_key": "",
+  "bucket": "backup-database",
+  "aes_key_b64": "",
+  "callback_url": "http://127.0.0.1/api/worker/callback"
+}
